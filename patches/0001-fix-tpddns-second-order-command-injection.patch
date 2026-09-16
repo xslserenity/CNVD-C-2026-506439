@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Security Researcher <security@example.invalid>
+Date: Wed, 16 Sep 2026 00:00:00 +0800
+Subject: [PATCH] tpddns: prevent stored command injection
+
+Validate the cloud username both before persistence and immediately before
+the shell execution sink. Encode the value as one POSIX shell argument so
+shell metacharacters from existing UCI data cannot be evaluated.
+
+NOTE: The tpddns.lua context below is reconstructed from the supplied firmware
+report and is intended as an integration reference. Regenerate this hunk from
+the target repository before opening a PR. The new security module hunk is
+complete and is checked byte-for-byte by the regression suite.
+diff --git a/usr/lib/lua/luci/controller/admin/tpddns.lua b/usr/lib/lua/luci/controller/admin/tpddns.lua
+index 1111111..2222222 100644
+--- a/usr/lib/lua/luci/controller/admin/tpddns.lua
++++ b/usr/lib/lua/luci/controller/admin/tpddns.lua
+@@ -1,5 +1,7 @@
+ local nixio = require "nixio"
++local tpddns_security =
++    require "luci.controller.admin.tpddns_security"
+ 
+ -- Existing module declarations remain unchanged.
+ 
+@@ -35,6 +37,11 @@ function bind_action(request)
+     local result = t.ENONE
+ 
++    local valid = request and
++        tpddns_security.validate_username(request.username)
++    if not valid then
++        return t.EEXPT
++    end
++
+     -- Existing bind state update logic remains unchanged.
+ 
+     local username = request.username
+@@ -213,7 +220,10 @@ function start_get_domain_list(data)
+         return t.EEXPT
+     end
+ 
+-    d.fork_exec("getDomainList " .. username)
++    local command = tpddns_security.build_get_domain_list_command(username)
++    if not command then
++        return t.EEXPT
++    end
++    d.fork_exec(command)
+     return t.ENONE
+ end
+diff --git a/usr/lib/lua/luci/controller/admin/tpddns_security.lua b/usr/lib/lua/luci/controller/admin/tpddns_security.lua
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/usr/lib/lua/luci/controller/admin/tpddns_security.lua
+@@ -0,0 +1,61 @@
++-- Security helpers for TPDDNS command construction.
++--
++-- This module is intentionally compatible with Lua 5.1. It performs the
++-- checks at the command-execution boundary so that values already persisted
++-- in UCI cannot bypass validation.
++
++local M = {}
++
++M.MAX_USERNAME_BYTES = 255
++
++function M.validate_username(value)
++    if type(value) ~= "string" then
++        return nil, "username must be a string"
++    end
++
++    if #value == 0 then
++        return nil, "username must not be empty"
++    end
++
++    if #value > M.MAX_USERNAME_BYTES then
++        return nil, "username is too long"
++    end
++
++    -- NUL, CR/LF, DEL, and other control bytes have no valid role in a cloud
++    -- account identifier and complicate downstream logging and IPC handling.
++    if string.find(value, "%c") then
++        return nil, "username contains a control character"
++    end
++
++    -- Quoting prevents shell metacharacter injection. This additional check
++    -- prevents the username from being interpreted as an option by the
++    -- getDomainList program itself.
++    if string.sub(value, 1, 1) == "-" then
++        return nil, "username must not begin with '-'"
++    end
++
++    return true
++end
++
++function M.shell_quote(value)
++    local valid, err = M.validate_username(value)
++    if not valid then
++        return nil, err
++    end
++
++    -- POSIX shell single-quote encoding. A literal apostrophe is represented
++    -- by closing the quote, emitting an escaped apostrophe, and reopening it.
++    return "'" .. string.gsub(value, "'", "'\\''") .. "'"
++end
++
++function M.build_get_domain_list_command(username)
++    local quoted, err = M.shell_quote(username)
++    if not quoted then
++        return nil, err
++    end
++
++    return "getDomainList " .. quoted
++end
++
++return M
+-- 
+-- 2.43.0
